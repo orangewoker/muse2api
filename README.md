@@ -65,6 +65,8 @@
    # 按需编辑 .env，建议修改 MUSE2API_KEY 为你自己的管理密钥
    ```
 
+   Docker Compose 会读取 `.env` 中的 `MUSE2API_KEY`，不会再被 Compose 文件中的示例值覆盖。
+
 3. **启动容器**：
    ```bash
    docker compose up -d
