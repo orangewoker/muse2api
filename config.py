@@ -92,6 +92,10 @@ class Config:
     # 对外地址（管理页面显示「接入地址」用；留空则页面用当前域名兜底）
     public_base: str = field(
         default_factory=lambda: _env("MUSE2API_PUBLIC_BASE", ""))
+    repo_url: str = field(default_factory=lambda: _env(
+        "MUSE2API_REPO", "https://github.com/orangewoker/muse2api").rstrip("/"))
+    queue_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_QUEUE_TIMEOUT", "900")))
+    max_queue: int = field(default_factory=lambda: int(_env("MUSE2API_MAX_QUEUE", "100")))
 
     # 允许跨域调用导入接口的来源（Cookie 助手脚本从 muse.ai 页面提交时用）
     cors_origins: str = field(
@@ -131,6 +135,10 @@ class Config:
     @property
     def accounts_file(self) -> str:
         return os.path.join(self.data_dir, "accounts.json")
+
+    @property
+    def api_key_file(self) -> str:
+        return os.path.join(self.data_dir, ".api_key")
 
     @property
     def tasks_file(self) -> str:

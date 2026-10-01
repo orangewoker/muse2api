@@ -522,7 +522,7 @@
   <section class="tab" id="tab-tasks">
     <div class="card">
       <h3>生成任务记录 <span class="tag" id="taskCount">0</span></h3>
-      <div class="hint">生视频是异步任务，状态会从 queued → processing → succeeded / failed。</div>
+      <div class="hint">生视频是异步任务，状态会从 queued → processing → completed / failed（长时间无心跳时显示 stalled）。</div>
       <div style="margin-bottom:12px;display:flex;gap:9px">
         <button class="ghost mini" onclick="loadTasks()">刷新</button>
         <button class="danger mini" onclick="clearTasks()">清空全部</button>
@@ -637,7 +637,7 @@ curl -X POST <span class="s">"BASE/v1/videos"</span> \
 
 <span class="c"># ② 轮询结果</span>
 curl <span class="s">"BASE/v1/videos/task_xxx"</span> -H <span class="s">"Authorization: Bearer $MUSE2API_KEY"</span>
-<span class="c"># → {"status":"succeeded","result":{"url":"/v1/media/xxx.mp4"}}</span></pre>
+<span class="c"># → {"status":"completed","result":{"url":"/v1/media/xxx.mp4"}}</span></pre>
 
       <h4>5. Python（openai SDK 兼容）</h4>
       <pre class="code"><span class="cp" onclick="cp(this)">复制</span><span class="k">from</span> openai <span class="k">import</span> OpenAI
@@ -656,7 +656,7 @@ t = requests.post(<span class="s">"BASE/v1/videos"</span>, json={<span class="s"
 <span class="k">while</span> <span class="k">True</span>:
     s = requests.get(<span class="s">f"BASE/v1/videos/{t['id']}"</span>,
                      headers={<span class="s">"Authorization"</span>:<span class="s">"Bearer m2a_..."</span>}).json()
-    <span class="k">if</span> s[<span class="s">"status"</span>] <span class="k">in</span> (<span class="s">"succeeded"</span>,<span class="s">"failed"</span>): <span class="k">break</span>
+    <span class="k">if</span> s[<span class="s">"status"</span>] <span class="k">in</span> (<span class="s">"completed"</span>,<span class="s">"failed"</span>): <span class="k">break</span>
     time.sleep(<span class="s">5</span>)
 <span class="k">print</span>(s)</pre>
 

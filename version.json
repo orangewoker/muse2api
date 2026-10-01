@@ -1,10 +1,10 @@
 {
-  "version": "1.5.3",
+  "version": "1.5.4",
   "updated_at": "2026-10-01",
-  "repo": "https://github.com/czg86389-hub/muse2api",
+  "repo": "https://github.com/orangewoker/muse2api",
   "highlights": [
-    "修复 HTTP 403、网络超时被误判为 Cookie 失效；保留上次已确认的账号状态",
-    "修复上游 5xx 和未分配会话被误报保活成功；保留完整 HTTP 诊断",
-    "保活不再凭空延长 Cookie 有效期；新增账号健康回归测试"
+    "合入上游 PR #2 / #5：Compose 环境变量、FIFO 调度、CDP 单读循环、入参校验与鉴权加固",
+    "补齐排队超时通知、断流取消和任务终态，保留 v1.5.3 账号健康修复",
+    "Docker 重建保留自动密钥，在线升级默认使用 orangewoker/muse2api；新增离线回归测试"
   ]
 }

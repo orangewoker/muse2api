@@ -1,5 +1,5 @@
 """Offline media-selection regression using an isolated Chromium. No account/API calls."""
-import sys, importlib.util, json, tempfile, inspect, socket, shutil, os
+import sys, importlib.util, json, tempfile, inspect, socket, shutil, os, time
 from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -21,6 +21,13 @@ with tempfile.TemporaryDirectory(prefix='muse-media-test-', dir=Path.home()) as 
  engine=module.MuseEngine(cfg)
  try:
   engine.start();page=engine._open_page();engine.page=page
+  page.js('''document.body.innerHTML='<aside><div class="hatch-chat-groupable-bubble hatch-agent-bubble-bg">Sidebar</div></aside><main><div class="hatch-chat-groupable-bubble hatch-agent-bubble-bg">Reply</div><div class="hatch-chat-groupable-bubble hatch-agent-bubble-bg"> </div></main>';''')
+  assert engine._agent_count()==1 and engine._agent_text()=='Reply'
+  assert engine._poll_chat()==(1,'Reply',False)
+  page.js('''document.querySelector('main').innerHTML='<textarea></textarea>';''')
+  engine.reset_thread(for_chat=True)
+  assert engine._agent_count()==0 and engine._agent_text()==''
+  print('PASS: empty skeletons and sidebar bubbles excluded from chat polling/reset')
   page.js('''document.body.innerHTML=`<div class="group/msg"><button><img class="outline-media-protection-border" src="data:image/png;base64,aW5wdXQ="></button></div>`;''')
   upload=engine.attachments()
   page.js('''document.body.innerHTML=`<div data-testid="hatch-chat-attachment-presentation-image"><img class="outline-media-protection-border" src="data:image/png;base64,b3V0cHV0"></div><div class="group/msg"><button><img class="outline-media-protection-border" src="data:image/png;base64,aW5wdXQ="></button></div>`;''')
@@ -61,3 +68,14 @@ with tempfile.TemporaryDirectory(prefix='muse-media-test-', dir=Path.home()) as 
    print('PASS: input preview excluded; exact selected bytes; all old sources ignored; video retained; scoped download; upload failure closed')
  finally:
   engine.stop()
+  # Windows Chrome helpers exit shortly after Browser.close; wait for their
+  # inherited log handle before TemporaryDirectory attempts recursive cleanup.
+  if os.name == 'nt':
+   for _ in range(50):
+    try:
+     os.unlink(os.path.join(tmp, 'chromium.log'))
+     break
+    except FileNotFoundError:
+     break
+    except PermissionError:
+     time.sleep(0.1)

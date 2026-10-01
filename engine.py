@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import uuid
 
@@ -48,6 +49,7 @@ class MuseEngine:
         self.current_acc_id: str | None = None
         self._last_http_renew: dict[str, float] = {}
         self._log = None
+        self._lifecycle_lock = threading.RLock()
         os.makedirs(cfg.profile_dir, exist_ok=True)
 
     # ---------------- 浏览器生命周期 ----------------
@@ -55,6 +57,10 @@ class MuseEngine:
         return f"http://127.0.0.1:{self.cfg.cdp_port}/json/version"
 
     def start(self):
+        with self._lifecycle_lock:
+            return self._start()
+
+    def _start(self):
         if self.proc and self.proc.poll() is None and self.browser:
             return
         env = dict(os.environ)
@@ -108,17 +114,36 @@ class MuseEngine:
         raise MuseGenerationError(f"Chromium 启动失败: {last}")
 
     def stop(self):
+        with self._lifecycle_lock:
+            return self._stop()
+
+    def _stop(self):
+        # Gracefully exit the entire browser tree (not only the Windows launcher).
+        # Otherwise child processes retain chromium.log/profile handles after Popen exits.
+        if self.browser:
+            try:
+                self.browser.send("Browser.close", timeout=2)
+            except Exception:
+                pass
         for c in (self.page, self.browser):
             if c:
                 c.close()
         self.page = self.browser = None
         if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
             try:
-                self.proc.wait(timeout=10)
+                self.proc.wait(timeout=5)
             except Exception:  # noqa: BLE001
-                self.proc.kill()
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=3)
+                except Exception:
+                    self.proc.kill()
+                    self.proc.wait(timeout=3)
         self.proc = None
+        self.current_acc_id = None
+        if self._log is not None:
+            self._log.close()
+            self._log = None
 
     # ---------------- 页面 ----------------
     def _open_page(self):
@@ -329,20 +354,23 @@ class MuseEngine:
                 while time.time() < t_end:
                     time.sleep(0.08)
                     ready = bool(self.page.js("""(function(){
+                        var scope = document.querySelector('main,[class*="chat-scroll"],[class*="hatch-chat-scroll"]')
+                                    || document.body;
                         return document.readyState === 'complete'
                             && !!document.querySelector('textarea')
-                            && document.querySelectorAll('div[class*="hatch-chat-groupable-bubble"]').length === 0;
+                            && scope.querySelectorAll('div[class*="hatch-chat-groupable-bubble"]').length === 0;
                     })()"""))
                     if ready:
                         break
                 if not ready:
                     raise MuseGenerationError(
                         "重置会话失败：页面在 10s 内未回到干净的 /thread/new（可能需要重新登录或账号 VM 异常）")
-                self._wait_ws_ready(self.page, timeout=12.0)
+                if not self._wait_ws_ready(self.page, timeout=12.0):
+                    raise MuseGenerationError("重置会话后 WebSocket 未就绪，请稍后重试")
         except MuseGenerationError:
             raise
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            raise MuseGenerationError(f"重置会话失败: {type(exc).__name__}") from exc
 
     def ensure_page(self, cookies: dict, expires: dict | None = None, account_id: str | None = None):
         if self.page is not None and (account_id is None or getattr(self, "current_acc_id", None) == account_id):
@@ -782,9 +810,14 @@ class MuseEngine:
     """
 
     # ---------------- 文本 / 代码对话 ----------------
+    _CHAT_SCOPE_JS = (
+        "var scope=document.querySelector('main,[class*=\"chat-scroll\"],[class*=\"hatch-chat-scroll\"]')"
+        "||document.body;"
+    )
     _AGENT_TEXT_JS = (
         "(function(){"
-        "var bs=[].slice.call(document.querySelectorAll("
+        + _CHAT_SCOPE_JS +
+        "var bs=[].slice.call(scope.querySelectorAll("
         "'div[class*=\"hatch-chat-groupable-bubble\"]'));"
         "for(var i=bs.length-1;i>=0;i--){"
         "var cs=bs[i].className||'';"
@@ -796,7 +829,8 @@ class MuseEngine:
     )
     _USER_COUNT_JS = (
         "(function(){"
-        "var bs=[].slice.call(document.querySelectorAll("
+        + _CHAT_SCOPE_JS +
+        "var bs=[].slice.call(scope.querySelectorAll("
         "'div[class*=\"hatch-chat-groupable-bubble\"]'));"
         "var n=0;for(var i=0;i<bs.length;i++){"
         "if(/chat-user-bubble/.test(bs[i].className||''))n++;}"
@@ -804,7 +838,8 @@ class MuseEngine:
     )
     _AGENT_COUNT_JS = (
         "(function(){"
-        "var bs=[].slice.call(document.querySelectorAll("
+        + _CHAT_SCOPE_JS +
+        "var bs=[].slice.call(scope.querySelectorAll("
         "'div[class*=\"hatch-chat-groupable-bubble\"]'));"
         "var n=0;for(var i=0;i<bs.length;i++){"
         "if(/hatch-agent-bubble-bg/.test(bs[i].className||'')){"
@@ -820,12 +855,13 @@ class MuseEngine:
     # 同时返回真实计数（仅含非空气泡），避免骨架气泡污染 cnt 判定。
     _POLL_CHAT_JS = (
         "(function(){"
+        + _CHAT_SCOPE_JS +
         "var els=[...document.querySelectorAll('*')].filter(function(e){"
         "var s=getComputedStyle(e);"
         "return (s.overflowY==='auto'||s.overflowY==='scroll')&&e.scrollHeight>e.clientHeight+100;});"
         "els.sort(function(a,b){return b.scrollHeight-a.scrollHeight;});"
         "if(els[0])els[0].scrollTop=els[0].scrollHeight;"
-        "var all=[].slice.call(document.querySelectorAll('div[class*=\"hatch-chat-groupable-bubble\"]'))"
+        "var all=[].slice.call(scope.querySelectorAll('div[class*=\"hatch-chat-groupable-bubble\"]'))"
         ".filter(function(b){return /hatch-agent-bubble-bg/.test(b.className||'');});"
         "var nonEmpty=all.filter(function(b){return ((b.innerText||'').trim().length)>0;});"
         "var txt=nonEmpty.length?(nonEmpty[nonEmpty.length-1].innerText||'').trim():'';"

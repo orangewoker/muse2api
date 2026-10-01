@@ -34,6 +34,7 @@ import logging
 import os
 import re
 import threading
+import queue
 import time
 import uuid
 import zipfile
@@ -42,11 +43,12 @@ from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                Response, StreamingResponse)
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from config import CFG
 from engine import ESSENTIAL_COOKIES, MuseAuthError, MuseEngine, MuseGenerationError
-from scheduler import ST_DONE, ST_FAILED, ST_QUEUED, ST_RUNNING, ST_TIMEOUT, Scheduler
+from scheduler import (ST_DONE, ST_FAILED, ST_QUEUED, ST_RUNNING, ST_TIMEOUT,
+                       QueueTimeout, RunTimeout, Scheduler, SchedulerStopped)
 from store import Store, account_expiry, min_expiry
 
 import sys
@@ -58,7 +60,7 @@ if not log.handlers:
     log.addHandler(_h)
 
 CFG.ensure_dirs()
-app = FastAPI(title="muse2api", version="1.5.3")
+app = FastAPI(title="muse2api", version="1.5.4")
 
 # Cookie 助手脚本从 muse.ai 页面发起导入请求，需要放行该来源；
 # 浏览器扩展从 chrome-extension:// 发起，也一并放行。
@@ -90,8 +92,8 @@ IMAGE_TASK_LOCK = threading.Lock()
 # 语义是「engine 自己的超时（video 默认 600s）应先生效」；看门狗只处理
 # engine 连自己的超时都没走完就卡死的情况，所以取 video_timeout + 300s 余量。
 # 之前设成 *2（1200s）过长 —— 真出问题时用户要等 20 分钟才看到失败。
-SCHED = Scheduler(GEN_LOCK, max_queue=100, queue_timeout=900,
-                  run_timeout=CFG.video_timeout + 300)
+SCHED = Scheduler(GEN_LOCK, max_queue=CFG.max_queue, queue_timeout=CFG.queue_timeout,
+                  run_timeout=max(CFG.image_timeout, CFG.video_timeout, CFG.chat_timeout) + 300)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -155,15 +157,18 @@ async def _validation_exc(request: Request, exc: RequestValidationError):
 @app.middleware("http")
 async def _guard_method_not_allowed(request: Request, call_next):
     response = await call_next(request)
-    if (response.status_code == 405
-            and request.url.path.startswith("/v1/")):
+    path = request.url.path
+    public_admin = {"/admin/extension", "/admin/extension/files", "/admin/cookie-helper",
+                    "/admin/update/check", "/admin/repo/status"}
+    protected = ((path.startswith("/v1/") and not path.startswith("/v1/media/"))
+                 or (path.startswith("/admin/") and path not in public_admin))
+    if response.status_code == 405 and protected:
         auth_err = _check_bearer(request.headers.get("authorization"))
         if auth_err is not None:
-            return JSONResponse(
-                status_code=401,
-                content={"error": {"message": auth_err,
-                                   "type": "invalid_request_error",
-                                   "param": None, "code": 401}})
+            content = ({"error": {"message": auth_err, "type": "invalid_request_error",
+                                  "param": None, "code": 401}}
+                       if path.startswith("/v1/") else {"detail": auth_err})
+            return JSONResponse(status_code=401, content=content)
     return response
 
 
@@ -232,14 +237,9 @@ def resolve_model(name: str | None, default: str = "muse-image") -> str:
 
 # ------------------------- 鉴权 -------------------------
 def auth(authorization: str | None = Header(default=None)):
-    if not CFG.api_key:
-        return True
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(401, "缺少 Authorization: Bearer <key>")
-    parts = authorization.split(None, 1)
-    token = parts[1].strip() if len(parts) > 1 else ""
-    if not token or token != CFG.api_key:
-        raise HTTPException(401, "API key 无效")
+    error = _check_bearer(authorization)
+    if error:
+        raise HTTPException(401, error)
     return True
 
 
@@ -279,96 +279,90 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
 
 def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                      timeout: int, account_id: str | None):
-    """在独立线程中执行 chat_stream，通过 Queue 往外吐增量文本。
-
-    **锁的获取方式已改**：不再由本函数内的线程直接 `with GEN_LOCK`
-    抢占，而是把「整段生成」作为一个 job 提交给 SCHED（FIFO 单 worker），
-    由 worker 在持锁状态下执行。这样 chat / image / video 三条路径
-    都走同一条公平队列，先来先得（修缺陷 3 / 10）。
-
-    无论下游客户端何时断连、异常或超时，stop_event + finally 块保证
-    100% 立即释放锁并让出 worker，绝不死锁。
-    若首字前遇到单账号 VM 卡死或会话异常，自动切换下一个健康账号重试一次。
-    """
-    import queue
-    q = queue.Queue(maxsize=100)
+    """FIFO streaming with bounded, cancellation-aware producer backpressure."""
+    chunks = queue.Queue(maxsize=100)
     stop_event = threading.Event()
 
-    def job():
-        """由调度器 worker 在持锁状态下执行；负责跑完整个生成过程。"""
-        cur_id = account_id
-        cur_cookies = cookies
-        cur_exp = expires
+    def emit(chunk):
+        while not stop_event.is_set():
+            SCHED.raise_if_interrupted()
+            try:
+                chunks.put(chunk, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def generate():
+        cur_id, cur_cookies, cur_exp = account_id, cookies, expires
         last_exc = None
-        try:
-            for attempt in range(2):
+        for attempt in range(2):
+            if stop_event.is_set():
+                return
+            SCHED.raise_if_interrupted()
+            if attempt:
+                alt = store.pick_account(rotate=True, force_rotate=True, exclude_id=cur_id)
+                if not alt or alt["id"] == cur_id:
+                    break
+                cur_id, cur_cookies, cur_exp = alt["id"], alt["cookies"], alt.get("cookies_exp")
+            yielded = False
+            try:
+                if cur_id:
+                    refreshed = _renew_and_persist(cur_id, wake_vm=True, force=bool(attempt))
+                    if refreshed:
+                        cur_cookies, cur_exp = refreshed["cookies"], refreshed.get("cookies_exp")
+                SCHED.raise_if_interrupted()
                 if stop_event.is_set():
                     return
-                if attempt > 0:
-                    alt = store.pick_account(rotate=True, force_rotate=True, exclude_id=cur_id)
-                    if not alt or alt["id"] == cur_id:
-                        break
-                    cur_id = alt["id"]
-                    cur_cookies = alt["cookies"]
-                    cur_exp = alt.get("cookies_exp")
-                    log.info("【对话自动切号】切换到备用账号 %s (%s) 重试...", alt.get("label"), cur_id)
-                yielded = False
-                try:
-                    if cur_id:
-                        refreshed = _renew_and_persist(cur_id, wake_vm=True, force=(attempt > 0))
-                        if refreshed:
-                            cur_cookies = refreshed["cookies"]
-                            cur_exp = refreshed.get("cookies_exp")
-                    if stop_event.is_set():
+                engine.start()
+                for chunk in engine.chat_stream(cur_cookies, prompt, cur_exp, timeout,
+                                                account_id=cur_id, stop_event=stop_event):
+                    if not emit(chunk):
                         return
-                    engine.start()
-                    for chunk in engine.chat_stream(
-                        cur_cookies, prompt, cur_exp, timeout,
-                        account_id=cur_id, stop_event=stop_event
-                    ):
-                        yielded = True
-                        q.put(("data", chunk))
-                        if stop_event.is_set():
-                            return
-                    if cur_id:
-                        store.mark(cur_id, True, "")
-                        _sync_cookies(cur_id)
+                    yielded = True
+                if stop_event.is_set():
                     return
-                except MuseAuthError as exc:
-                    last_exc = exc
-                    if cur_id:
-                        store.mark(cur_id, False, str(exc))
-                    if yielded:
-                        break
-                except Exception as exc:
-                    last_exc = exc
+                SCHED.raise_if_interrupted()
+                if cur_id:
+                    store.mark(cur_id, True, "")
+                    _sync_cookies(cur_id)
+                return
+            except MuseAuthError as exc:
+                last_exc = exc
+                if cur_id:
+                    store.mark(cur_id, False, str(exc))
+            except Exception as exc:
+                SCHED.raise_if_interrupted()
+                last_exc = exc
+                if not stop_event.is_set():
                     try:
                         engine.reset_thread()
                     except Exception:
                         pass
-                    if yielded:
-                        break
-            if last_exc is not None:
-                q.put(("error", last_exc))
-        finally:
-            q.put(("done", None))
+            if yielded:
+                break
+        if last_exc:
+            raise last_exc
 
     try:
-        SCHED.submit(job, label="chat")
-    except Exception:  # noqa: BLE001  # 队列满
-        raise MuseGenerationError("生成队列已满，请稍后重试")
-
+        job = SCHED.submit(generate, label="chat")
+    except (queue.Full, SchedulerStopped) as exc:
+        raise MuseGenerationError("生成队列已满或正在关闭，请稍后重试") from exc
     try:
         while True:
-            kind, val = q.get()
-            if kind == "data":
-                yield val
-            elif kind == "error":
-                raise val
-            else:
-                break
+            try:
+                yield chunks.get(timeout=0.1)
+            except queue.Empty:
+                if job.wait_event.is_set():
+                    if job.error:
+                        if isinstance(job.error, MuseAuthError):
+                            raise job.error
+                        raise MuseGenerationError(str(job.error)) from job.error
+                    return
     finally:
         stop_event.set()
+        if not job.finished:
+            SCHED.cancel(job)
 
 
 # ------------------------- 参数校验（修缺陷 1 / 2 / 8） -------------------------
@@ -380,81 +374,90 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
 #     base64 乱码）时，`_normalize_image` 失败后**静默返回空**，任务照样往下跑，
 #     白等 1.5~3 倍时间才失败（实测 194.7s）。
 # 这里统一做「入口即校验」，把非法输入在提交阶段就打回去。
-_VIDEO_DURATIONS = {5, 6, 10}          # muse.ai 网页实际可选的时长档位
-_VALID_IMAGE_MIME = {"image/png", "image/jpeg", "image/jpg", "image/webp",
-                     "image/gif", "image/bmp"}
-_MAX_REF_BYTES = 20 * 1024 * 1024      # 参考图上限 20MB
+_VIDEO_DURATIONS = {5, 6, 8, 10}
+_VALID_IMAGE_MIME = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif", "image/bmp"}
+_MAX_REF_BYTES = 20 * 1024 * 1024
 
 
-def validate_video_duration(d: int | None) -> int:
-    """校验并归一视频时长。缺陷 1。"""
-    if d is None:
-        return 6
-    try:
-        di = int(d)
-    except (TypeError, ValueError):
-        raise HTTPException(400, f"duration 必须是整数，收到: {d!r}")
-    if di not in _VIDEO_DURATIONS:
-        raise HTTPException(
-            400,
-            f"不支持的 duration={di}，仅支持 {sorted(_VIDEO_DURATIONS)} 秒")
-    return di
+def validate_video_duration(d: int | None) -> int | None:
+    # Preserve the existing optional/default behavior and advertised 8s requests.
+    if d is not None and (isinstance(d, bool) or d not in _VIDEO_DURATIONS):
+        raise HTTPException(400, f"duration 仅支持 {sorted(_VIDEO_DURATIONS)} 秒")
+    return d
 
 
 def validate_size(size: str | None, aspect_ratio: str | None) -> None:
-    """校验尺寸/比例字符串。缺陷 2。"""
-    s = (size or "").strip().lower()
-    if not s:
-        return
-    # 允许 "auto" / "WxH" / 常见比例 "16:9"
-    if s == "auto":
-        return
-    if re.fullmatch(r"\d{2,5}x\d{2,5}", s):
-        w, h = (int(x) for x in s.split("x"))
-        if not (64 <= w <= 8192 and 64 <= h <= 8192):
-            raise HTTPException(400, f"size 尺寸超出范围(64~8192): {size!r}")
-        return
-    if re.fullmatch(r"\d{1,2}[:/]\d{1,2}", s):
-        return
-    if any(k in s for k in ("portrait", "landscape", "square", "竖屏", "横屏", "正方形")):
-        return
-    raise HTTPException(400, f"无法识别的 size/aspect_ratio: {size!r}")
+    for name, value in (("size", size), ("aspect_ratio", aspect_ratio)):
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value.strip():
+            raise HTTPException(400, f"{name} 必须是非空尺寸/比例字符串")
+        s = value.strip().lower()
+        if name == "size" and s == "auto":
+            continue
+        if name == "size" and re.fullmatch(r"\d{2,5}x\d{2,5}", s):
+            w, h = map(int, s.split("x"))
+            if 64 <= w <= 8192 and 64 <= h <= 8192:
+                continue
+        if re.fullmatch(r"\d{1,2}[:/]\d{1,2}", s):
+            w, h = map(int, re.split(r"[:/]", s))
+            if w > 0 and h > 0:
+                continue
+        if s in {"portrait", "landscape", "square", "竖屏", "横屏", "正方形"}:
+            continue
+        raise HTTPException(400, f"无法识别或超出范围的 {name}: {value!r}")
 
 
 def validate_reference_image(ref: str | None) -> str | None:
-    """校验参考图输入。缺陷 8。
-
-    只做「轻量校验」——不下载远程图、不解码大 base64，避免在请求线程里
-    产生新的长阻塞；真正无法使用的输入会在生成阶段被 MuseGenerationError
-    明确抛出，而不是像以前那样静默忽略继续跑。
-    返回归一后的字符串（可能带 400 抛错）。
-    """
+    """Bounded base64 validation without remote downloads in the HTTP handler."""
+    from urllib.parse import urlsplit
+    import binascii
     if ref is None:
         return None
-    if not isinstance(ref, str):
-        raise HTTPException(400, "reference_image 必须是字符串（URL / data URI / base64）")
+    if not isinstance(ref, str) or not ref.strip():
+        raise HTTPException(400, "参考图必须是非空 URL / data URI / base64 字符串")
     s = ref.strip()
-    if not s:
-        return None
-    if len(s) > _MAX_REF_BYTES * 2:   # base64 膨胀约 4/3，留余量
-        raise HTTPException(400, f"参考图数据过大（>{_MAX_REF_BYTES // 1024 // 1024}MB）")
+    if len(s) > ((_MAX_REF_BYTES + 2) // 3) * 4 + 1024:
+        raise HTTPException(400, "参考图超过 20MB 上限")
+    if s.lower().startswith(("http://", "https://")):
+        try:
+            url = urlsplit(s)
+            if not url.hostname or url.username or url.password or any(c.isspace() for c in s):
+                raise ValueError()
+            _ = url.port
+        except ValueError:
+            raise HTTPException(400, "参考图 URL 无效") from None
+        return s
+    payload = s
     if s.startswith("data:"):
-        head = s.split(",", 1)[0]
-        mime = head.split(";")[0].replace("data:", "").strip().lower()
-        if mime and mime not in _VALID_IMAGE_MIME:
-            raise HTTPException(400, f"参考图 MIME 不受支持: {mime}")
-        if "," not in s or not s.split(",", 1)[1].strip():
-            raise HTTPException(400, "data URI 参考图内容为空")
-        return s
-    if s.startswith(("http://", "https://")):
-        return s
-    # 纯 base64（无 data: 前缀）：粗略校验字符集与长度
-    if re.fullmatch(r"[A-Za-z0-9+/=\s]+", s):
-        if len(s) < 32:
-            raise HTTPException(400, "base64 参考图数据过短，疑似非法")
-        return s
-    raise HTTPException(
-        400, "reference_image 无法识别，仅支持 http(s) URL / data URI / base64")
+        head, sep, payload = s.partition(",")
+        mime = head[5:].split(";", 1)[0].lower()
+        if not sep or mime not in _VALID_IMAGE_MIME or not head.lower().endswith(";base64"):
+            raise HTTPException(400, "参考图必须是受支持的图片 base64 data URI")
+    try:
+        raw = base64.b64decode(payload, validate=True)
+    except (ValueError, binascii.Error):
+        raise HTTPException(400, "参考图 base64 内容无效") from None
+    if not raw or len(raw) > _MAX_REF_BYTES:
+        raise HTTPException(400, "参考图为空或超过 20MB 上限")
+    return s
+
+
+def _image_reference(req: ImageRequest) -> str | None:
+    ref = req.reference_image if req.reference_image is not None else req.image
+    if ref is None and req.images:
+        ref = req.images[0]
+    return _reference_value(ref)
+
+
+def _reference_value(ref) -> str | None:
+    if isinstance(ref, dict):
+        ref = ref.get("image_url", ref.get("url", ref.get("b64_json")))
+        if isinstance(ref, dict):
+            ref = ref.get("url")
+        if ref is None:
+            raise HTTPException(400, "参考图对象必须包含 url / b64_json / image_url")
+    return validate_reference_image(ref)
 
 
 class ImageRequest(BaseModel):
@@ -475,11 +478,11 @@ class ImageRequest(BaseModel):
 class VideoRequest(BaseModel):
     prompt: str
     model: str = "muse-video"
-    duration: int | None = None
+    duration: int | None = Field(default=None, strict=True)
     size: str | None = None
     aspect_ratio: str | None = None
     resolution: str | None = None
-    timeout: int | None = None
+    timeout: int | None = Field(default=None, ge=1, le=600)
     extra: str | None = None
     image: Any = None
     image_url: Any = None
@@ -505,7 +508,7 @@ class ChatRequest(BaseModel):
     stream: bool = False
     temperature: float | None = None
     max_tokens: int | None = None
-    timeout: int | None = None
+    timeout: int | None = Field(default=None, ge=1, le=600)
     prompt: str | None = None       # 兼容把 prompt 直接放顶层的客户端
     # 下面这些声明出来只是为了「能读到」，muse.ai 端不做对应处理
     tools: list | None = None
@@ -521,7 +524,7 @@ class ResponsesRequest(BaseModel):
     instructions: str | None = None
     stream: bool = False
     max_output_tokens: int | None = None
-    timeout: int | None = None
+    timeout: int | None = Field(default=None, ge=1, le=600)
     tools: list | None = None
     store: bool | None = None
 
@@ -908,6 +911,9 @@ def _run_generation(prompt: str, kind: str, timeout: int,
     #
     # 上游原先在此处 `GEN_LOCK.acquire(timeout=...)`；因 GEN_LOCK 不可重入，
     # 调度器 worker 已持锁后再抢会永久自锁，故抢锁职责上移至调度器。
+    if not GEN_LOCK.locked():
+        raise RuntimeError("生成操作必须经调度器持有浏览器锁")
+    SCHED.raise_if_interrupted()
     deadline = time.monotonic() + max(1, timeout)
     return _run_generation_locked(prompt, kind, timeout, account_id,
                                   on_progress, reference_image, deadline=deadline)
@@ -927,6 +933,7 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
     last_exc = None
     cur_acc = acc
     for attempt in range(2):
+        SCHED.raise_if_interrupted()
         if deadline is not None and time.monotonic() >= deadline:
             raise MuseGenerationError("任务总等待时限已到，停止重试")
         if attempt > 0:
@@ -941,6 +948,7 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
             refreshed = _renew_and_persist(cur_acc["id"], wake_vm=True, force=(attempt > 0))
             if refreshed:
                 cur_acc = refreshed
+            SCHED.raise_if_interrupted()
             engine.start()
             remaining = int(deadline - time.monotonic()) if deadline is not None else timeout
             if remaining <= 0:
@@ -949,6 +957,7 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                                   timeout=remaining, expires=cur_acc.get("cookies_exp"),
                                   account_id=cur_acc["id"], on_progress=on_progress,
                                   reference_image=reference_image)
+            SCHED.raise_if_interrupted()
             store.mark(cur_acc["id"], True, "")
             _sync_cookies(cur_acc["id"])
             return res, cur_acc["id"]
@@ -956,6 +965,8 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
             last_exc = exc
             store.mark(cur_acc["id"], False, str(exc))
             engine.stop()
+        except (QueueTimeout, RunTimeout):
+            raise
         except MuseGenerationError as exc:
             last_exc = exc
             store.mark(cur_acc["id"], True, f"任务异常: {str(exc)[:60]}")
@@ -1002,7 +1013,6 @@ def _image_response(req: ImageRequest, res: dict) -> dict:
 
 def _queue_image(req: ImageRequest, prompt: str, reference_image: str | None,
                  idempotency_key: str | None = None):
-    """Opt-in polling avoids reverse-proxy timeouts; no generation is repeated by polling."""
     if idempotency_key and len(idempotency_key) > 256:
         raise HTTPException(400, "Idempotency-Key too long")
     key_hash = hashlib.sha256(idempotency_key.encode()).hexdigest() if idempotency_key else None
@@ -1021,59 +1031,58 @@ def _queue_image(req: ImageRequest, prompt: str, reference_image: str | None,
                         "object": "image.task", "status": existing["status"],
                         "progress": existing.get("progress", 0),
                         "created_at": existing["created_at"]})
-        # ponytail: one Chromium worker; cap admission instead of adding a broker.
         if sum(t.get("kind") == "image" and t.get("status") in ("queued", "processing")
                for t in tasks) >= 8:
             raise HTTPException(429, "Image queue is full; retry later")
         task = store.create_task("image", req.prompt)
-        tid = task["id"]
+        tid, t0 = task["id"], time.time()
         store.update_task(tid, api_prompt=prompt, size=req.size,
-                          response_format=req.response_format, progress=0,
+                          response_format=req.response_format, progress=0, stage="queued",
                           image_request_key=key_hash, image_request_hash=request_hash)
 
-    def worker():
-        # 经 FIFO 调度器排队执行（与 chat/video 共用一条队列，单 worker 持锁）。
-        # 不可直接裸调 _run_generation —— 该函数假定调用方已持锁。
-        # 注意 progress=5 的「已开始处理」要等真正拿到执行权后再打，
-        # 否则排队期间就显示 processing 会误导用户（缺陷 9 同类问题）。
-        t0 = time.time()
-        try:
-            def _do():
-                store.update_task(tid, status="processing", progress=5)
-                return _run_generation(
-                    prompt, "image", req.timeout or CFG.image_timeout,
-                    reference_image=reference_image,
-                    on_progress=lambda p: store.update_task(tid, progress=p))
+        def generate():
+            store.update_task(tid, status=ST_RUNNING, progress=5, stage="rendering")
+            return _run_generation(
+                prompt, "image", req.timeout or CFG.image_timeout,
+                reference_image=reference_image,
+                on_progress=lambda p: _task_progress(tid, p))
 
-            res, acc_id = _run_generation_sched(
-                _do, label="image:%s" % tid[-8:])
-            # Store only media metadata, not large base64 payloads or reference credentials.
-            store.update_task(tid, status="completed", progress=100, account=acc_id,
-                              elapsed=round(time.time() - t0, 1),
-                              url=media_url(res["filename"]),
+        def complete(job):
+            if job.error:
+                _task_failed(tid, job.error, t0)
+                return
+            res, acc_id = job.result_value
+            store.update_task(tid, status=ST_DONE, progress=100, stage="done", account=acc_id,
+                              elapsed=round(time.time() - t0, 1), url=media_url(res["filename"]),
                               result={**{k: res[k] for k in ("filename", "size", "kind")},
                                       "url": media_url(res["filename"])})
-        except Exception as exc:  # noqa: BLE001
-            store.update_task(tid, status="failed", error=str(exc),
-                              elapsed=round(time.time() - t0, 1))
-
-    threading.Thread(target=worker, daemon=True).start()
+        try:
+            SCHED.submit(generate, label="image:" + tid[-8:], on_done=complete)
+        except (queue.Full, SchedulerStopped) as exc:
+            _task_failed(tid, exc, t0)
+            raise HTTPException(429, "生成队列已满或正在关闭，请稍后重试") from exc
     return JSONResponse(status_code=202, content={
-        "id": tid, "task_id": tid, "object": "image.task", "status": "queued",
-        "progress": 0, "created_at": task["created_at"]})
+        "id": tid, "task_id": tid, "object": "image.task", "status": ST_QUEUED,
+        "progress": 0, "stage": "queued", "created_at": task["created_at"]})
+
+
+def _task_progress(tid, progress):
+    SCHED.raise_if_interrupted()
+    store.update_task(tid, progress=progress, stage="rendering")
+
+
+def _task_failed(tid, error, started):
+    stage = "timeout" if isinstance(error, (QueueTimeout, RunTimeout)) else "failed"
+    store.update_task(tid, status=ST_FAILED, stage=stage, error=str(error),
+                      elapsed=round(time.time() - started, 1))
 
 
 @app.post("/v1/images/tasks")
 def create_image_task(req: ImageRequest,
                       idempotency_key: str | None = Header(default=None), _=Depends(auth)):
-    ref_img = req.reference_image or req.image
-    if isinstance(ref_img, dict):
-        ref_img = ref_img.get("url") or ref_img.get("b64_json")
-    if not ref_img and req.images:
-        first = req.images[0]
-        ref_img = first.get("image_url") or first.get("url") if isinstance(first, dict) else first
+    validate_size(req.size, req.aspect_ratio)
+    ref_img = _image_reference(req)
     return _queue_image(req, build_image_prompt(req), ref_img, idempotency_key)
-
 
 @app.get("/v1/images/tasks/{task_id}")
 def get_image_task(task_id: str, _=Depends(auth)):
@@ -1087,61 +1096,36 @@ def get_image_task(task_id: str, _=Depends(auth)):
         out.update(_image_response(req, out["result"]))
     return out
 
-def _run_generation_sched(fn, label: str = "gen", timeout: float | None = None):
-    """同步提交给 FIFO 调度器并阻塞等待结果。
-
-    供**在独立线程中、无法 await** 的调用方使用（如 _queue_image 的 worker）。
-    与 async 版 `_sched_run` 语义一致：进入 SCHED 排队 → 由单 worker 持
-    GEN_LOCK 执行 → 返回结果。这样图片与 chat/video 共用同一条队列，
-    不会绕过调度器裸抢浏览器。
-    """
-    return SCHED.run_sync(fn, label=label, timeout=timeout)
-
-
 async def _sched_run(fn, label: str):
-    """把「需要占浏览器的同步生成函数」提交给 FIFO 调度器并 await 结果。
-
-    这样生图请求不再用裸锁抢，而是与 chat/video 一起排队（修缺陷 3 / 10）。
-    并行请求会按提交顺序执行，且不会出现线程饥饿。
-    """
     loop = asyncio.get_running_loop()
-    fut: asyncio.Future = loop.create_future()
+    future = loop.create_future()
 
-    def wrapped():
-        if fut.cancelled():
-            return
-        try:
-            result = fn()
-        except BaseException as exc:  # noqa: BLE001
-            loop.call_soon_threadsafe(_safe_set_exc, fut, exc)
-        else:
-            loop.call_soon_threadsafe(_safe_set_result, fut, result)
-
-    SCHED.submit(wrapped, label=label)
-    return await fut
-
-
-def _safe_set_result(fut: asyncio.Future, value):
-    if not fut.done():
-        fut.set_result(value)
-
-
-def _safe_set_exc(fut: asyncio.Future, exc: BaseException):
-    if not fut.done():
-        fut.set_exception(exc)
+    def complete(job):
+        def deliver():
+            if not future.done():
+                if job.error:
+                    future.set_exception(job.error)
+                else:
+                    future.set_result(job.result_value)
+        if not loop.is_closed():
+            loop.call_soon_threadsafe(deliver)
+    try:
+        job = SCHED.submit(fn, label=label, on_done=complete)
+    except (queue.Full, SchedulerStopped) as exc:
+        raise HTTPException(429, "生成队列已满或正在关闭，请稍后重试") from exc
+    try:
+        return await future
+    except asyncio.CancelledError:
+        SCHED.cancel(job)
+        raise
+    except (QueueTimeout, RunTimeout) as exc:
+        raise HTTPException(504, str(exc)) from exc
 
 
 @app.post("/v1/images/generations")
 async def images_generations(req: ImageRequest, _=Depends(auth)):
-    ref_img = req.reference_image or req.image
-    if isinstance(ref_img, dict):
-        ref_img = ref_img.get("url") or ref_img.get("b64_json")
-    if not ref_img and req.images and isinstance(req.images, list):
-        first = req.images[0]
-        ref_img = first.get("image_url") or first.get("url") if isinstance(first, dict) else first
-
-    validate_size(req.size, req.aspect_ratio)     # 缺陷 2
-    ref_img = validate_reference_image(ref_img)   # 缺陷 8
+    validate_size(req.size, req.aspect_ratio)
+    ref_img = _image_reference(req)
 
     prompt = build_image_prompt(req)
     timeout = req.timeout or CFG.image_timeout
@@ -1184,16 +1168,23 @@ async def images_edits(request: Request, _=Depends(auth)):
             try:
                 timeout = int(timeout_val)
             except ValueError:
-                pass
+                raise HTTPException(400, "timeout 必须是整数") from None
         img_field = form.get("image")
         if img_field and hasattr(img_field, "read"):
-            content = await img_field.read()
+            content = await img_field.read(_MAX_REF_BYTES + 1)
+            if len(content) > _MAX_REF_BYTES:
+                raise HTTPException(400, "参考图超过 20MB 上限")
             ref_mime = getattr(img_field, "content_type", "image/png") or "image/png"
             ref_image_data = f"data:{ref_mime};base64,{base64.b64encode(content).decode('ascii')}"
         elif isinstance(img_field, str):
             ref_image_data = img_field
     else:
-        body = await request.json()
+        try:
+            body = await request.json()
+        except ValueError:
+            raise HTTPException(400, "请求体不是有效 JSON") from None
+        if not isinstance(body, dict):
+            raise HTTPException(400, "请求体必须是 JSON 对象")
         async_mode = body.get("async", False)
         prompt = body.get("prompt") or ""
         model = body.get("model") or "muse-image"
@@ -1204,30 +1195,41 @@ async def images_edits(request: Request, _=Depends(auth)):
         img_val = body.get("image")
         if isinstance(img_val, dict):
             ref_image_data = img_val.get("url") or img_val.get("b64_json")
-        elif isinstance(img_val, str):
+            if ref_image_data is None:
+                raise HTTPException(400, "参考图对象缺少 url / b64_json")
+        elif img_val is not None:
             ref_image_data = img_val
-        if not ref_image_data and body.get("images") and isinstance(body.get("images"), list):
+        if ref_image_data is None and body.get("images") and isinstance(body.get("images"), list):
             first = body["images"][0]
             if isinstance(first, dict):
-                ref_image_data = first.get("image_url") or first.get("url")
-            elif isinstance(first, str):
+                ref_image_data = _reference_value(first)
+            else:
                 ref_image_data = first
-        if not ref_image_data:
+        if ref_image_data is None:
             ref_image_data = body.get("reference_image") or body.get("image_url")
 
     if not prompt:
         prompt = "参考此图片并进行生图创作"
 
-    req_obj = ImageRequest(
-        prompt=prompt,
-        model=model,
-        size=size,
-        aspect_ratio=aspect_ratio,
-        response_format=response_format,
-        timeout=timeout,
-        reference_image=ref_image_data,
-        **{"async": async_mode}
-    )
+    validate_size(size, aspect_ratio)
+    ref_image_data = _reference_value(ref_image_data)
+    if timeout is not None:
+        if isinstance(timeout, bool) or not re.fullmatch(r"\d+", str(timeout)):
+            raise HTTPException(400, "timeout 必须是整数")
+        try:
+            timeout = int(timeout)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "timeout 必须是整数") from None
+        if not 1 <= timeout <= 600:
+            raise HTTPException(400, "timeout 必须在 1~600 秒之间")
+
+    try:
+        req_obj = ImageRequest(
+            prompt=prompt, model=model, size=size, aspect_ratio=aspect_ratio,
+            response_format=response_format, timeout=timeout,
+            reference_image=ref_image_data, **{"async": async_mode})
+    except ValidationError as exc:
+        raise RequestValidationError(exc.errors()) from exc
     full_prompt = build_image_prompt(req_obj)
     gen_timeout = timeout or CFG.image_timeout
     if req_obj.async_:
@@ -1253,14 +1255,14 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
     validate_video_duration(req.duration)          # 缺陷 1：时长白名单
     validate_size(req.size, req.aspect_ratio)      # 缺陷 2：尺寸/比例校验
     ref_img = None
-    if req.reference_image:
+    if req.reference_image is not None:
         ref_img = req.reference_image
-    elif req.image_url:
-        ref_img = req.image_url if isinstance(req.image_url, str) else (req.image_url.get("url") if isinstance(req.image_url, dict) else None)
-    elif req.image:
-        ref_img = req.image.get("url") if isinstance(req.image, dict) else req.image
+    elif req.image_url is not None:
+        ref_img = req.image_url
+    elif req.image is not None:
+        ref_img = req.image
 
-    ref_img = validate_reference_image(ref_img)   # 缺陷 8：非法参考图入口即拒
+    ref_img = _reference_value(ref_img)   # 缺陷 8：非法参考图入口即拒
 
     prompt = build_video_prompt(req)
     timeout = req.timeout or CFG.video_timeout
@@ -1268,48 +1270,39 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
     store.update_task(task["id"], api_prompt=prompt,
                       status=ST_QUEUED, progress=0, stage="queued")
 
-    def job():
-        """由调度器 worker 在持锁状态下执行。"""
-        store.update_task(task["id"], status=ST_RUNNING, progress=10,
-                          stage="rendering")
-        t0 = time.time()
-        try:
-            def prog_cb(p):
-                store.update_task(task["id"], progress=p, stage="rendering")
-            res, acc_id = _run_generation(prompt, "video", timeout,
-                                          on_progress=prog_cb, reference_image=ref_img)
-            vurl = media_url(res["filename"])
-            store.update_task(task["id"], status=ST_DONE, progress=100,
-                              stage="done",
-                              account=acc_id,
-                              elapsed=round(time.time() - t0, 1),
-                              url=vurl,
-                              video={"url": vurl},
-                              result={"url": vurl,
-                                      "filename": res["filename"],
-                                      "bytes": res["size"], "kind": res["kind"]})
-        except Exception as exc:  # noqa: BLE001
-            store.update_task(task["id"], status=ST_FAILED, stage="failed",
-                              elapsed=round(time.time() - t0, 1), error=str(exc))
+    t0 = time.time()
 
+    def generate():
+        store.update_task(task["id"], status=ST_RUNNING, progress=10, stage="rendering")
+        return _run_generation(prompt, "video", timeout,
+                               on_progress=lambda p: _task_progress(task["id"], p),
+                               reference_image=ref_img)
+
+    def complete(job):
+        if job.error:
+            _task_failed(task["id"], job.error, t0)
+            return
+        res, acc_id = job.result_value
+        vurl = media_url(res["filename"])
+        store.update_task(task["id"], status=ST_DONE, progress=100, stage="done", account=acc_id,
+                          elapsed=round(time.time() - t0, 1), url=vurl, video={"url": vurl},
+                          result={"url": vurl, "filename": res["filename"],
+                                  "bytes": res["size"], "kind": res["kind"]})
     try:
-        SCHED.submit(job, label=f"video:{task['id'][-8:]}")
-    except Exception as exc:  # noqa: BLE001  # 队列满
-        store.update_task(task["id"], status=ST_FAILED, stage="rejected",
-                          error=f"服务繁忙，生成队列已满: {exc}")
-        raise HTTPException(503, "生成队列已满，请稍后重试") from exc
-
+        SCHED.submit(generate, label="video:" + task["id"][-8:], on_done=complete)
+    except (queue.Full, SchedulerStopped) as exc:
+        _task_failed(task["id"], exc, t0)
+        raise HTTPException(429, "生成队列已满或正在关闭，请稍后重试") from exc
     return {"id": task["id"], "task_id": task["id"], "object": "video.task",
-            "status": ST_QUEUED, "progress": 0,
-            "queue_size": SCHED.queue_size,
-            "created_at": task["created_at"]}
+            "status": ST_QUEUED, "progress": 0, "stage": "queued",
+            "queue_size": SCHED.queue_size, "created_at": task["created_at"]}
 
 
 @app.get("/v1/videos/{task_id}")
 @app.get("/v1/videos/generations/{task_id}")
 def get_video(task_id: str, _=Depends(auth)):
     t = store.get_task(task_id)
-    if not t:
+    if not t or t.get("kind") != "video":
         raise HTTPException(404, "task 不存在")
     out = dict(t)
     status = out.get("status")
@@ -1466,10 +1459,6 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
                 yield _sse({"error": {"message": str(exc), "type": "auth_error", "code": 401}})
             except MuseGenerationError as exc:
                 store.mark(acc_id, True, f"助手超时: {str(exc)[:60]}")
-                try:
-                    engine.reset_thread()
-                except Exception:
-                    pass
                 yield _sse({"error": {"message": str(exc), "type": "server_error", "code": 502}})
             except Exception as exc:
                 yield _sse({"error": {"message": f"内部错误: {exc}", "type": "server_error", "code": 500}})
@@ -1864,6 +1853,7 @@ def rotate_apikey(_=Depends(auth)):
     new_key = "m2a_" + secrets.token_hex(24)
     old = CFG.api_key
     CFG.api_key = new_key
+    _save_generated_key(new_key)
     _persist_env("MUSE2API_KEY", new_key)
     return {"ok": True, "api_key": new_key, "previous": old,
             "message": "已生成新 Key 并立即生效；旧 Key 已失效，请更新下游项目"}
@@ -2161,12 +2151,15 @@ def get_keepalive_status(_=Depends(auth)):
 
 
 # ------------------------- 仓库实时更新检测、通知与一键在线升级 -------------------------
-REPO_URL = "https://github.com/czg86389-hub/muse2api"
+REPO_URL = CFG.repo_url.removesuffix(".git")
+if not re.fullmatch(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", REPO_URL):
+    raise ValueError("MUSE2API_REPO 必须是 https://github.com/owner/repository")
+REPO_PATH = REPO_URL.split("github.com/", 1)[1]
 TRACKED_REPO_PATHS = [
-    "app.py", "engine.py", "store.py", "cdp.py", "config.py",
+    "app.py", "engine.py", "store.py", "cdp.py", "config.py", "scheduler.py",
     "admin.html", "README.md", "version.json", "requirements.txt",
-    "Dockerfile", "docker-compose.yml", ".env.example", ".gitignore",
-    "LICENSE", "extension", "deploy", "tools",
+    "Dockerfile", "docker-compose.yml", ".env.example", ".gitignore", ".dockerignore",
+    "LICENSE", "extension", "deploy", "tools", "tests",
 ]
 _UPDATE_CACHE: dict[str, Any] = {"ts": 0.0, "data": None}
 
@@ -2218,9 +2211,9 @@ def _git(args: list[str], timeout: int = 30):
 
 
 def _ensure_git_repo(token: str = ""):
-    """确保 BASE_DIR 已初始化为绑定 czg86389-hub/muse2api 的 Git 仓库。"""
+    """确保 BASE_DIR 已初始化为绑定配置的 GitHub 更新仓库。"""
     git_dir = os.path.join(BASE_DIR, ".git")
-    remote_url = f"https://x-access-token:{token}@github.com/czg86389-hub/muse2api.git" if token else f"{REPO_URL}.git"
+    remote_url = f"https://x-access-token:{token}@github.com/{REPO_PATH}.git" if token else f"{REPO_URL}.git"
     if not os.path.isdir(git_dir):
         _git(["init", "-b", "main"])
         _git(["remote", "add", "origin", remote_url])
@@ -2228,12 +2221,12 @@ def _ensure_git_repo(token: str = ""):
         _git(["reset", "--mixed", "origin/main"])
     else:
         _git(["remote", "set-url", "origin", remote_url])
-    _git(["config", "user.name", "czg86389-hub"])
-    _git(["config", "user.email", "czg86389-hub@users.noreply.github.com"])
+    _git(["config", "user.name", REPO_PATH.split("/", 1)[0]])
+    _git(["config", "user.email", REPO_PATH.split("/", 1)[0] + "@users.noreply.github.com"])
 
 
 def _check_update_sync(force: bool = False) -> dict:
-    """检测 GitHub 官方仓库 (czg86389-hub/muse2api) 是否有新版本或新提交。
+    """检测配置的 GitHub 仓库 是否有新版本或新提交。
     默认缓存 90 秒，防止频繁刷新触发 GitHub API 速率限制。"""
     now = time.time()
     if not force and _UPDATE_CACHE["data"] and (now - _UPDATE_CACHE["ts"]) < 90:
@@ -2270,7 +2263,7 @@ def _check_update_sync(force: bool = False) -> dict:
     highlights = list(local_ver_obj.get("highlights") or [])
     try:
         rv = requests.get(
-            f"https://raw.githubusercontent.com/czg86389-hub/muse2api/main/version.json?t={int(now)}",
+            f"https://raw.githubusercontent.com/{REPO_PATH}/main/version.json?t={int(now)}",
             timeout=6,
         )
         if rv.status_code == 200:
@@ -2289,7 +2282,7 @@ def _check_update_sync(force: bool = False) -> dict:
         if token:
             headers["Authorization"] = f"Bearer {token}"
         resp = requests.get(
-            "https://api.github.com/repos/czg86389-hub/muse2api/commits?sha=main&per_page=5",
+            f"https://api.github.com/repos/{REPO_PATH}/commits?sha=main&per_page=5",
             headers=headers,
             timeout=6,
         )
@@ -2369,7 +2362,7 @@ def _upgrade_from_github_sync() -> dict:
 
     if not upgraded_via:
         resp = requests.get(
-            "https://codeload.github.com/czg86389-hub/muse2api/tar.gz/refs/heads/main",
+            f"https://codeload.github.com/{REPO_PATH}/tar.gz/refs/heads/main",
             timeout=60,
         )
         if resp.status_code != 200:
@@ -2475,22 +2468,39 @@ async def admin_repo_push(payload: dict = Body(default={}), _=Depends(auth)):
     return await asyncio.to_thread(_do_push)
 
 
+def _save_generated_key(key: str):
+    temporary = CFG.api_key_file + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as key_file:
+        key_file.write(key + "\n")
+    try:
+        os.chmod(temporary, 0o600)
+    except OSError:
+        pass
+    os.replace(temporary, CFG.api_key_file)
+
+
 @app.on_event("startup")
 async def _startup():
     for task in list(store.tasks.values()):
-        if task.get("kind") == "image" and task.get("status") in ("queued", "processing"):
-            store.update_task(task["id"], status="failed", error="服务重启中断了任务，请重新提交")
+        if task.get("kind") in ("image", "video") and task.get("status") in ("queued", "processing"):
+            store.update_task(task["id"], status="failed", stage="interrupted", error="服务重启中断了任务，请重新提交")
+    if not CFG.api_key and os.path.isfile(CFG.api_key_file):
+        with open(CFG.api_key_file, encoding="utf-8") as key_file:
+            CFG.api_key = key_file.read().strip()
     if not CFG.api_key:
         import secrets
         new_key = "m2a_" + secrets.token_hex(24)
         CFG.api_key = new_key
-        _persist_env("MUSE2API_KEY", new_key)
+        _save_generated_key(new_key)
         log.info("🔑 未检测到 MUSE2API_KEY，已自动生成初始密钥: %s", new_key)
     SCHED.start()
-    asyncio.create_task(_keepalive_loop())
+    app.state.keepalive_task = asyncio.create_task(_keepalive_loop())
 
 
 @app.on_event("shutdown")
 def _shutdown():
+    task = getattr(app.state, "keepalive_task", None)
+    if task:
+        task.cancel()
     SCHED.stop()
     engine.stop()

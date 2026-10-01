@@ -270,6 +270,10 @@ class Store:
             t = self.tasks.get(tid)
             if not t:
                 return None
+            # A late browser heartbeat after cancellation/watchdog must not mutate
+            # a terminal result or make a failed task look active again.
+            if t.get("status") in ("completed", "failed") and "status" not in kw:
+                return t
             t.update(kw)
             t["updated_at"] = int(time.time())
             _write(self.cfg.tasks_file, self.tasks)

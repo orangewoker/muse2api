@@ -1,5 +1,10 @@
 # MUSE2API
 
+> 本仓库为 [orangewoker/muse2api](https://github.com/orangewoker/muse2api) 维护分支，基于原项目 v1.5.3。
+> v1.5.4 已移植原仓库 [PR #2](https://github.com/czg86389-hub/muse2api/pull/2) 和
+> [PR #5](https://github.com/czg86389-hub/muse2api/pull/5)，并补齐排队超时通知、断流取消及完整入口校验。
+> 原项目与 PR 作者的贡献保留在 Git 提交历史中。服务器安装步骤见 [Docker Compose 部署](deploy/README-compose.md)。
+
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue?logo=python" alt="Python Version" />
   <img src="https://img.shields.io/badge/FastAPI-0.115%2B-009688?logo=fastapi" alt="FastAPI" />
@@ -55,7 +60,7 @@
 
 1. **克隆代码并进入目录**：
    ```bash
-   git clone https://github.com/czg86389-hub/muse2api.git
+   git clone https://github.com/orangewoker/muse2api.git
    cd muse2api
    ```
 
@@ -66,10 +71,13 @@
    ```
 
    Docker Compose 会读取 `.env` 中的 `MUSE2API_KEY`，不会再被 Compose 文件中的示例值覆盖。
+   同名宿主环境变量优先于 `.env`。建议设置随机密钥以及 `MUSE2API_PUBLIC_BASE=http://服务器IP:18610`
+   （或实际 HTTPS 域名），以返回可被远程客户端访问的媒体绝对地址。
+   密钥留空时自动生成并保存在 `data/.api_key`，容器重启和重建不会更换它。
 
 3. **启动容器**：
    ```bash
-   docker compose up -d
+   docker compose up -d --build
    ```
 
 4. **访问管理面板**：
@@ -204,7 +212,7 @@ curl -X POST "http://localhost:18610/v1/images/generations" \
   ```json
   {
     "id": "task_xyz789",
-    "status": "succeeded",
+      "status": "completed",
     "progress": 100,
     "result": {
       "url": "http://localhost:18610/v1/media/vid_xyz789.mp4"
@@ -227,6 +235,10 @@ curl -X POST "http://localhost:18610/v1/images/generations" \
 | `MUSE2API_IMAGE_TIMEOUT` | `240` | 生图超时上限（秒） |
 | `MUSE2API_VIDEO_TIMEOUT` | `600` | 生视频超时上限（秒） |
 | `MUSE2API_CHAT_TIMEOUT` | `300` | 对话生成超时上限（秒） |
+| `MUSE2API_QUEUE_TIMEOUT` | `900` | FIFO 队列等待超时；超时通知调用方并跳过执行 |
+| `MUSE2API_MAX_QUEUE` | `100` | 浏览器队列容量（异步图片另保留最多 8 个待处理任务） |
+| `MUSE2API_REPO` | `https://github.com/orangewoker/muse2api` | 在线检测更新与升级使用的仓库 |
+| `MUSE2API_BIND` | `0.0.0.0` | Compose 宿主机端口绑定地址，不改变容器内部监听 |
 
 ---
 

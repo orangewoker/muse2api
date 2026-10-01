@@ -1,23 +1,33 @@
-version: '3.8'
-
 services:
   muse2api:
     build: .
     image: muse2api:latest
     container_name: muse2api
-    restart: always
+    restart: unless-stopped
     ports:
-      - "18610:18610"
+      - "${MUSE2API_BIND:-0.0.0.0}:${MUSE2API_PORT:-18610}:18610"
     environment:
-      # 管理与 API 鉴权 Key（从 .env 或宿主环境读取，留空则自动生成）
-      - MUSE2API_KEY=${MUSE2API_KEY:-}
-      # 服务对外基准 URL，如 https://your-domain.com（留空则管理前端自动检测当前域名）
-      - MUSE2API_PUBLIC_BASE=
-      # 超时配置（秒）
-      - MUSE2API_IMAGE_TIMEOUT=240
-      - MUSE2API_VIDEO_TIMEOUT=600
-      - MUSE2API_CHAT_TIMEOUT=300
+      MUSE2API_KEY: ${MUSE2API_KEY:-}
+      MUSE2API_PUBLIC_BASE: ${MUSE2API_PUBLIC_BASE:-}
+      MUSE2API_REPO: ${MUSE2API_REPO:-https://github.com/orangewoker/muse2api}
+      MUSE2API_IMAGE_TIMEOUT: ${MUSE2API_IMAGE_TIMEOUT:-240}
+      MUSE2API_VIDEO_TIMEOUT: ${MUSE2API_VIDEO_TIMEOUT:-600}
+      MUSE2API_CHAT_TIMEOUT: ${MUSE2API_CHAT_TIMEOUT:-300}
+      MUSE2API_QUEUE_TIMEOUT: ${MUSE2API_QUEUE_TIMEOUT:-900}
+      MUSE2API_MAX_QUEUE: ${MUSE2API_MAX_QUEUE:-100}
+      MUSE2API_TOOL_PROTOCOL: ${MUSE2API_TOOL_PROTOCOL:-0}
+      MUSE2API_PROFILE_ROOT: /app/data/profiles
     volumes:
-      # 持久化账号配置、任务日志及媒体文件
       - ./data:/app/data
-    shm_size: '2gb' # 保证 Chromium 渲染多标签页时不因 /dev/shm 耗尽崩溃
+    shm_size: '2gb'
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18610/healthz', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'

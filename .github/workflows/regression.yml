@@ -1,0 +1,29 @@
+name: Docker and offline regressions
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Compose interpolation
+        run: python3 tests/test_compose_config.py
+      - name: Build production image
+        run: docker compose build
+      - name: Run offline regressions in Linux/Chromium
+        run: >-
+          docker run --rm
+          --mount type=bind,src=${{ github.workspace }},dst=/workspace,readonly
+          --workdir /workspace
+          muse2api:latest python tests/run_regressions.py --skip-compose
+      - name: Test real Compose startup and persistent data
+        run: python3 tests/test_docker_smoke.py

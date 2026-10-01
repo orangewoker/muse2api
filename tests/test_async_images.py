@@ -104,23 +104,10 @@ async def check(source, home):
             assert kwargs.get("deadline") is not None
             return {"fixture": True}, None
         module._run_generation_locked = assert_owned
-        module._run_generation("lock fixture", "image", 1)
+        module.SCHED.run_sync(lambda: module._run_generation("lock fixture", "image", 1))
         module._run_generation_locked = locked_impl
         assert not module.GEN_LOCK.locked()
-        real_lock = module.GEN_LOCK
-        class BusyLock:
-            def acquire(self, timeout):
-                assert timeout == 1
-                return False
-        module.GEN_LOCK = BusyLock()
-        try:
-            module._run_generation("queue fixture", "image", 1)
-            raise AssertionError("busy browser must time out")
-        except module.MuseGenerationError:
-            pass
-        finally:
-            module.GEN_LOCK = real_lock
-        print("generation_lock_covers_retry_cleanup=PASS queue_wait_bounded=PASS")
+        print("generation_lock_covers_retry_cleanup=PASS scheduler_owns_lock=PASS")
     module._run_generation = generation
     headers = {"Authorization": "Bearer test-only"}
     async with Client(module.app, headers) as client:
@@ -206,6 +193,7 @@ async def check(source, home):
         await module._startup()
         assert module.store.get_task(pending["id"])["status"] == "failed"
         print("restart_marks_interrupted_tasks_failed=PASS")
+    module._shutdown()
     print("PASS async image API regression")
 
 

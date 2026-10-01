@@ -33,6 +33,8 @@ wheels/
 data/accounts.json
 data/tasks.json
 data/.installed_sha
+data/.api_key*
+data/profiles/
 data/debug-*.json
 data/media/*
 !data/media/.gitkeep
