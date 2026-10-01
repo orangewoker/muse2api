@@ -55,6 +55,16 @@ def check(home):
     resolved = json.loads(compose('config', '--format', 'json'))['services']['muse2api']
     assert Path(resolved['volumes'][0]['source']).resolve() == (Path(home) / 'data').resolve(), \
         'smoke test must never mount actual workspace data'
+    # On Linux, otherwise Docker/root creates these directories and the host's
+    # unprivileged test user cannot write fixtures or clean TemporaryDirectory.
+    data = Path(home) / 'data'
+    for relative in ('media', 'downloads', 'profiles/generate'):
+        (data / relative).mkdir(parents=True, exist_ok=True)
+    def persisted_key():
+        # The production key deliberately has mode 0600; read it as the container
+        # user, rather than weakening permissions for an unprivileged host test.
+        return compose('exec', '-T', 'muse2api', 'python', '-c',
+                       "from pathlib import Path; print(Path('/app/data/.api_key').read_text().strip())").strip()
     try:
         compose('up', '-d', '--no-build')
         ready()
@@ -66,7 +76,6 @@ def check(home):
                        {'prompt': 'fixture', 'duration': 999})[0] == 400
         scheduler = json.loads(request('/admin/scheduler', 'm2a_compose_smoke_fixture')[1])
         assert scheduler['worker_alive'] and scheduler['submitted'] == 0
-        data = Path(home) / 'data'
         media = data / 'media' / 'smoke.webp'
         media.write_bytes(b'offline media fixture')
         (data / 'accounts.json').write_text(json.dumps([
@@ -76,12 +85,12 @@ def check(home):
         write_env('')
         compose('up', '-d', '--no-build', '--force-recreate')
         ready()
-        automatic_key = (data / '.api_key').read_text().strip()
+        automatic_key = persisted_key()
         assert automatic_key.startswith('m2a_')
         assert request('/v1/models', automatic_key)[0] == 200
         compose('up', '-d', '--no-build', '--force-recreate')
         ready()
-        assert (data / '.api_key').read_text().strip() == automatic_key
+        assert persisted_key() == automatic_key
         assert request('/v1/models', automatic_key)[0] == 200
         accounts = json.loads(request('/admin/accounts', automatic_key)[1])['accounts']
         assert accounts[0]['id'] == 'offline-fixture'
